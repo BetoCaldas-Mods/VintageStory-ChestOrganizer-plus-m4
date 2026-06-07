@@ -8,35 +8,21 @@ namespace ChestOrganizer;
 public static class Sorter {
     public static void Sort(this IInventory inventory, IComparer<ItemStack> comparer, ICoreClientAPI api, bool merge = true) {
         int n = inventory.Count;
-        var current = Enumerable
-            .Range(0, n)
-            .ToArray();
-        var from = current
-            .ToArray();
+        var current = Enumerable.Range(0, n).ToArray();
+        var from = current.ToArray();
         var order = current
-            .Order(new Comparer(inventory, comparer))
+            .Order(new SlotIndexComparer(inventory, comparer))
             .ToArray();
         var player = api.World.Player;
         var manager = player.InventoryManager;
+        var ops = new InventoryOps(inventory, n, api, player, manager);
 
-        // Move items to desired order.
         for (int i = 0; i < n; i++) {
             int j = order[i];
             int k = current[j];
             if (k == i) continue;
 
-            var targetSlot = inventory[i];
-            var sourceSlot = inventory[k];
-
-            if (targetSlot.Empty) {
-                if (!sourceSlot.Empty) {
-                    Move(sourceSlot, targetSlot);
-                }
-            } else if (sourceSlot.Empty) {
-                Move(targetSlot, sourceSlot);
-            } else {
-                Flip(sourceSlot, targetSlot);
-            }
+            if (!ops.RearrangeSlots(inventory[i], inventory[k])) continue;
 
             (from[i], from[k]) = (from[k], from[i]);
             current[from[i]] = i;
@@ -44,69 +30,109 @@ public static class Sorter {
         }
 
         if (!merge) return;
+        ops.MergeAdjacentStacks(n);
+    }
 
-        // Merge stacks.
-        bool changed = false;
-        for (int i = 0, j = 1; i < n - 1 && j < n; ) {
-            var target = inventory[i];
-            var source = inventory[j];
-            if (changed && target.CanTakeFrom(source)) {
-                changed = Move(source, target);
-                if (source.Empty) j++;
-            } else { 
-                changed = true;
-                i++;
-                if (i >= j) j = i + 1;
+    private sealed class InventoryOps {
+        private readonly IInventory inventory;
+        private readonly int slotCount;
+        private readonly ICoreClientAPI api;
+        private readonly IPlayer player;
+        private readonly IPlayerInventoryManager manager;
+
+        public InventoryOps(IInventory inventory, int slotCount, ICoreClientAPI api, IPlayer player, IPlayerInventoryManager manager) {
+            this.inventory = inventory;
+            this.slotCount = slotCount;
+            this.api = api;
+            this.player = player;
+            this.manager = manager;
+        }
+
+        public bool RearrangeSlots(ItemSlot target, ItemSlot source) {
+            if (target.Empty) {
+                return !source.Empty && Transfer(source, target);
+            }
+            if (source.Empty) {
+                return Transfer(target, source);
+            }
+            return SwapSlots(source, target);
+        }
+
+        public void MergeAdjacentStacks(int n) {
+            bool changed = false;
+            for (int i = 0, j = 1; i < n - 1 && j < n; ) {
+                var target = inventory[i];
+                var source = inventory[j];
+                if (changed && target.CanTakeFrom(source)) {
+                    changed = Transfer(source, target);
+                    if (source.Empty) j++;
+                } else {
+                    changed = true;
+                    i++;
+                    if (i >= j) j = i + 1;
+                }
             }
         }
 
-        bool Move(ItemSlot from, ItemSlot to) {
+        private bool Transfer(ItemSlot from, ItemSlot to) {
             int pre = from.StackSize;
-            int n = from.GetRemainingSlotSpace(to.Itemstack);
-            ItemStackMoveOperation op = new(api.World, EnumMouseButton.Left, 0, EnumMergePriority.AutoMerge, n);
-            op.ActingPlayer = player;
+            int amount = from.GetRemainingSlotSpace(to.Itemstack);
+            var op = new ItemStackMoveOperation(api.World, EnumMouseButton.Left, 0, EnumMergePriority.AutoMerge, amount) {
+                ActingPlayer = player,
+            };
             SendPacket(manager.TryTransferTo(from, to, ref op));
             return pre != from.StackSize;
         }
 
-        void Flip(ItemSlot a, ItemSlot b) {
-            // Some composite inventories (e.g. InventoryPlayerBackPack in VS 1.22+) have
-            // virtual/wrapper slots whose DidModifyItemSlot validation fails across
-            // sub-inventories. Catch the resulting ArgumentException to avoid crashing.
+        private bool SwapSlots(ItemSlot a, ItemSlot b) {
             try {
                 if (a.TryFlipWith(b)) {
                     SendPacket(a.Inventory.InvNetworkUtil.GetFlipSlotsPacket(b.Inventory, SlotId(b), SlotId(a)));
+                    return true;
                 }
             } catch (ArgumentException) {
-                // Swap failed: fall back to a two-move approach via Move to preserve
-                // as much ordering as possible.
-                if (!a.Empty && !b.Empty) {
-                    // If Move partially moves (e.g. stackable), accept it; otherwise skip.
-                    Move(a, b);
-                }
             }
+            return SwapViaEmptySlot(a, b);
         }
 
-        static int SlotId(ItemSlot slot) 
-            => slot.Inventory.GetSlotId(slot);
+        private bool SwapViaEmptySlot(ItemSlot a, ItemSlot b) {
+            var temp = FindEmptySlot(a, b);
+            if (temp == null) return false;
+            if (!Transfer(a, temp)) return false;
+            if (!Transfer(b, a)) {
+                Transfer(temp, a);
+                return false;
+            }
+            return Transfer(temp, b);
+        }
 
-        void SendPacket(object obj) {
+        private ItemSlot FindEmptySlot(ItemSlot a, ItemSlot b) {
+            for (int i = 0; i < slotCount; i++) {
+                var slot = inventory[i];
+                if (slot.Empty && slot != a && slot != b) return slot;
+            }
+            return null;
+        }
+
+        private static int SlotId(ItemSlot slot) => slot.Inventory.GetSlotId(slot);
+
+        private void SendPacket(object obj) {
             if (obj is Packet_Client packet) {
                 api.Network.SendPacketClient(packet);
             }
         }
     }
 
-    private class Comparer : IComparer<int> {
+    private sealed class SlotIndexComparer : IComparer<int> {
         private readonly IInventory inventory;
         private readonly IComparer<ItemStack> comparer;
 
-        public Comparer(IInventory inventory, IComparer<ItemStack> comparer) {
+        public SlotIndexComparer(IInventory inventory, IComparer<ItemStack> comparer) {
             this.inventory = inventory;
             this.comparer = comparer;
         }
 
-        public int Compare(int x, int y) 
+        public int Compare(int x, int y)
             => comparer.Compare(inventory[x].Itemstack, inventory[y].Itemstack);
     }
 }

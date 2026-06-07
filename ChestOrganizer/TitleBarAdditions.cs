@@ -26,6 +26,7 @@ public class TitleBarAdditions {
     private ICoreClientAPI api;
     private InventoryBase inventory;
     private GuiDialogBlockEntityInventory dialog;
+    private bool sorting;
 
     public TitleBarAdditions(GuiElementDialogTitleBar bar) {
         this.bar = bar;
@@ -77,8 +78,14 @@ public class TitleBarAdditions {
         => (inventory as MergedInventory)?.Split();
 
     private void Sort() {
-        var comparer = api.ModifierDown(Modifier.Shift) ? Comparer.Name : Comparer.Code;
-        inventory.Sort(comparer, api);
+        if (sorting) return;
+        sorting = true;
+        try {
+            var comparer = api.ModifierDown(Modifier.Shift) ? Comparer.Name : Comparer.Code;
+            inventory.Sort(comparer, api);
+        } finally {
+            sorting = false;
+        }
     }
 
     private void Find() 
