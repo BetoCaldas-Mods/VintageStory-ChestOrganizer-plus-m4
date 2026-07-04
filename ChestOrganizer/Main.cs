@@ -46,33 +46,87 @@ public class Main : ModSystem {
             return true;
         }
 
-        var reinforcement = api.ModLoader.GetModSystem<ModSystemBlockReinforcement>();
+        MergedInventory.SyncStaticState(api);
 
         float range = player.WorldData.PickingRange + 1;
         float rangesq = range * range;
         var eyePos = player.Entity.SidedPos.XYZ.Add(player.Entity.LocalEyePos - 0.5f);
-        var accessor = api.World.BlockAccessor;
-        List<BlockEntityGenericTypedContainer> chests = new();
+        var reinforcement = api.ModLoader.GetModSystem<ModSystemBlockReinforcement>();
+        var containers = CollectContainersInRange(player, range, rangesq, eyePos, reinforcement);
+        var chests = PrepareContainersForMerge(player, containers);
 
-        accessor.WalkBlocks((eyePos - range).AsBlockPos, (eyePos + (range + 1.0f)).AsBlockPos, Step);
-
-        MergedInventory.MergeRange(chests, api);
+        if (chests.Count > 0) {
+            MergedInventory.MergeRange(chests, api);
+        }
 
         return true;
+    }
 
+    private ContainerScan CollectContainersInRange(
+        IPlayer player,
+        float range,
+        float rangesq,
+        Vec3d eyePos,
+        ModSystemBlockReinforcement reinforcement) {
+        var scan = new ContainerScan();
+        var accessor = api.World.BlockAccessor;
+        accessor.WalkBlocks(
+            (eyePos - range).AsBlockPos,
+            (eyePos + (range + 1.0f)).AsBlockPos,
+            (Block b, int x, int y, int z) => StepContainer(player, rangesq, eyePos, reinforcement, scan, x, y, z));
+        return scan;
+    }
 
-        void Step(Block b, int x, int y, int z) {
-            if (eyePos.SquareDistanceTo(x, y, z) > rangesq) return;
-            var pos = new BlockPos(x, y, z);
-            var entity = accessor.GetBlockEntity<BlockEntityGenericTypedContainer>(pos);
-            if (entity == null) return;
-
-            if (reinforcement.IsLockedForInteract(pos, player)) return;
-            if (IsClaimRestricted(pos, player)) return;
-            if (entity.Inventory.HasOpened(player)) return;
-
-            chests.Add(entity);
+    private void StepContainer(
+        IPlayer player,
+        float rangesq,
+        Vec3d eyePos,
+        ModSystemBlockReinforcement reinforcement,
+        ContainerScan scan,
+        int x,
+        int y,
+        int z) {
+        if (eyePos.SquareDistanceTo(x, y, z) > rangesq) return;
+        var pos = new BlockPos(x, y, z);
+        var entity = api.World.BlockAccessor.GetBlockEntity<BlockEntityGenericTypedContainer>(pos);
+        if (entity == null) return;
+        if (reinforcement.IsLockedForInteract(pos, player)) return;
+        if (IsClaimRestricted(pos, player)) return;
+        if (entity.Inventory.HasOpened(player)) {
+            scan.OpenedInRange.Add(entity);
+            return;
         }
+        scan.ToOpen.Add(entity);
+    }
+
+    private List<BlockEntityGenericTypedContainer> PrepareContainersForMerge(
+        IPlayer player,
+        ContainerScan scan) {
+        if (scan.ToOpen.Count > 0) {
+            return scan.ToOpen;
+        }
+        if (scan.OpenedInRange.Count == 0 || MergedInventory.IsMergedDialogVisible(api)) {
+            return scan.ToOpen;
+        }
+
+        var openSingleChestPositions = api.OpenedGuis
+            .OfType<GuiDialogBlockEntityInventory>()
+            .Select(dialog => dialog.BlockEntityPosition)
+            .ToHashSet();
+        var ghosts = scan.OpenedInRange
+            .Where(entity => !openSingleChestPositions.Contains(entity.Pos))
+            .ToList();
+        if (ghosts.Count == 0) {
+            return scan.ToOpen;
+        }
+
+        MergedInventory.RecoverGhostContainers(api, player, ghosts, openSingleChestPositions);
+        return ghosts;
+    }
+
+    private sealed class ContainerScan {
+        public List<BlockEntityGenericTypedContainer> ToOpen { get; } = new();
+        public List<BlockEntityGenericTypedContainer> OpenedInRange { get; } = new();
     }
 
     private bool IsClaimRestricted(BlockPos pos, IPlayer player) {

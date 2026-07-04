@@ -22,23 +22,77 @@ public class MergedInventory : InventoryBase {
     private int count;
 
     public static void MergeFromDialog(GuiDialogBlockEntityInventory source, ICoreClientAPI api) {
+        SyncStaticState(api);
         current ??= new(api);
         current.AddFromDialog(source);
     }
 
 
     public static void MergeRange(IEnumerable<BlockEntityOpenableContainer> containers, ICoreClientAPI api) {
+        SyncStaticState(api);
         current ??= new(api);
         current.AddRange(containers);
     }
 
+    public static void SyncStaticState(ICoreClientAPI api) {
+        if (dialog != null && !IsMergedDialogOpen(api)) {
+            if (current != null) {
+                current.AbortOpen();
+            } else {
+                dialog.Dispose();
+                dialog = null;
+            }
+        }
+        if (current != null && current.parts.Count == 0) {
+            current = null;
+        }
+    }
+
+    public static int RecoverGhostContainers(
+        ICoreClientAPI api,
+        IPlayer player,
+        IEnumerable<BlockEntityGenericTypedContainer> openedInRange,
+        HashSet<BlockPos> openSingleChestPositions) {
+        int closed = 0;
+        foreach (var entity in openedInRange) {
+            if (!entity.Inventory.HasOpened(player)) continue;
+            if (openSingleChestPositions.Contains(entity.Pos)) continue;
+            player.InventoryManager.CloseInventory(entity.Inventory);
+            SendPacket(api, entity.Pos, open: false);
+            closed++;
+        }
+        if (closed > 0) {
+            SyncStaticState(api);
+        }
+        return closed;
+    }
+
+    private static bool IsMergedDialogOpen(ICoreClientAPI api)
+        => api.OpenedGuis.OfType<GuiDialogMergedInventory>().Any();
+
+    public static bool IsMergedDialogVisible(ICoreClientAPI api)
+        => IsMergedDialogOpen(api);
+
     private static void UpdateDialog(ICoreClientAPI api) {
         if (dialog == null) {
             dialog = new(Lang.Get("chestorganizer:title"), current, api);
-            dialog.TryOpen();
+            if (!TryShowDialog(api)) {
+                current?.AbortOpen();
+            }
         } else {
             dialog.Compose();
         }
+    }
+
+    private static bool TryShowDialog(ICoreClientAPI api) {
+        dialog.TryOpen();
+        if (IsMergedDialogOpen(api)) {
+            return true;
+        }
+        api.Logger.Warning("[ChestOrganizer] Merged inventory UI failed to open; closing containers.");
+        dialog.Dispose();
+        dialog = null;
+        return false;
     }
 
     public static bool OnServerPacket(BlockEntityOpenableContainer container, int id) {
@@ -112,11 +166,32 @@ public class MergedInventory : InventoryBase {
     private void UpdateParts() {
         if (parts.Count == 0) {
             dialog?.TryClose();
+            current = null;
+            dialog = null;
             api.World.Player.InventoryManager.CloseInventory(this);
         } else {
             UpdateCount();
             dialog?.Compose();
         }
+    }
+
+    private void AbortOpen() {
+        if (dialog != null) {
+            if (IsMergedDialogOpen(api)) {
+                dialog.TryClose();
+            } else {
+                dialog.Dispose();
+            }
+            dialog = null;
+        }
+        current = null;
+        var toClose = parts.ToList();
+        parts.Clear();
+        count = 0;
+        foreach (var part in toClose) {
+            part.Close();
+        }
+        api.World.Player.InventoryManager.CloseInventory(this);
     }
 
     private bool HandleServerPacket(BlockEntityOpenableContainer container, int id) {
